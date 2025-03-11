@@ -1,0 +1,152 @@
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.linear_model import Lasso
+from sklearn.ensemble import RandomForestRegressor
+import matplotlib.pyplot as plt
+import seaborn as sns
+from itertools import combinations
+
+# 1. Data Preparation with Lagged Features, Rolling Returns, Z-Scores, and Interactions
+def load_and_prepare_hybrid_data(file_path, max_lag=5, horizons=[1, 5, 10, 20], z_score_window=20):
+    df = pd.read_csv(file_path)
+    if 'date' not in df.columns:
+        df['date'] = pd.date_range(start='2020-01-01', periods=len(df), freq='D')
+    df.set_index('date', inplace=True)
+    
+    # Base returns column
+    base_return_col = 'returns'
+    features = [col for col in df.columns if col != base_return_col]
+    X_base = df[features]
+    
+    # Create lagged features
+    X_lagged = pd.DataFrame(index=X_base.index)
+    for feature in features:
+        for lag in range(0, max_lag + 1):  # Include lag 0
+            X_lagged[f'{feature}_lag{lag}'] = X_base[feature].shift(lag)
+    
+    # Add rolling z-scores
+    for feature in features:
+        rolling_mean = X_base[feature].rolling(window=z_score_window, min_periods=1).mean()
+        rolling_std = X_base[feature].rolling(window=z_score_window, min_periods=1).std()
+        X_lagged[f'{feature}_zscore'] = (X_base[feature] - rolling_mean) / rolling_std
+    
+    # Create interaction effects (for original features only, not lags)
+    interaction_features = []
+    for feat1, feat2 in combinations(features, 2):  # Pairwise combinations
+        X_lagged[f'{feat1}_x_{feat2}'] = X_base[feat1] * X_base[feat2]
+        interaction_features.append(f'{feat1}_x_{feat2}')
+    
+    # Create rolling forward returns
+    y_dict = {}
+    for horizon in horizons:
+        y_dict[f'returns_{horizon}'] = (df[base_return_col]
+                                      .shift(-horizon)
+                                      .rolling(window=horizon, min_periods=horizon)
+                                      .sum())
+    
+    y_df = pd.DataFrame(y_dict, index=df.index)
+    
+    # Drop NaN rows
+    valid_idx = X_lagged.dropna().index.intersection(y_df.dropna().index)
+    X_lagged = X_lagged.loc[valid_idx]
+    y_df = y_df.loc[valid_idx]
+    
+    return X_lagged, y_df, interaction_features
+
+# 2. Initial Feature Selection with Lagged Features, Z-Scores, and Interactions
+def screen_lagged_features(X, y, k=20):
+    f_selector = SelectKBest(score_func=f_regression, k=k)
+    f_selector.fit(X, y)
+    
+    feature_scores = pd.DataFrame({
+        'Feature': X.columns,
+        'F_Score': f_selector.scores_
+    }).sort_values('F_Score', ascending=False)
+    
+    return feature_scores
+
+def lasso_lagged_selection(X, y, alpha=0.01):
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    lasso = Lasso(alpha=alpha)
+    lasso.fit(X_scaled, y)
+    
+    feature_importance = pd.DataFrame({
+        'Feature': X.columns,
+        'Coefficient': np.abs(lasso.coef_)
+    }).sort_values('Coefficient', ascending=False)
+    
+    return feature_importance
+
+# 3. Test Top Features Across Rolling Returns
+def rf_feature_importance(X, y):
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    rf = RandomForestRegressor(n_estimators=100, random_state=42)
+    rf.fit(X_train, y_train)
+    
+    feature_importance = pd.DataFrame({
+        'Feature': X.columns,
+        'Importance': rf.feature_importances_
+    }).sort_values('Importance', ascending=False)
+    
+    return feature_importance
+
+# 4. Visualize Results
+def plot_feature_importance(feature_df, title, value_col, top_n=20):
+    plt.figure(figsize=(12, 6))
+    sns.barplot(x=value_col, y='Feature', data=feature_df.head(top_n))
+    plt.title(title)
+    plt.xlabel(f'{value_col} Score')
+    plt.show()
+
+# Main execution
+def main():
+    file_path = 'your_data.csv'
+    max_lag = 5
+    horizons = [1, 5, 10, 20]
+    z_score_window = 20  # Rolling window for z-scores
+    
+    # Load data with lags, z-scores, interactions, and rolling returns
+    X_lagged, y_df, interaction_features = load_and_prepare_hybrid_data(file_path, max_lag, horizons, z_score_window)
+    
+    # Step 1: Initial feature selection using 1-period return
+    y_initial = y_df['returns_1']
+    print("=== Initial Feature Selection with Lagged Features, Z-Scores, and Interactions (1-period return) ===")
+    
+    # F-test
+    f_scores = screen_lagged_features(X_lagged, y_initial)
+    print("Top features by F-test:")
+    print(f_scores.head(20))
+    plot_feature_importance(f_scores, 'F-test Scores (1-period Return)', 'F_Score')
+    
+    # Lasso
+    lasso_importance = lasso_lagged_selection(X_lagged, y_initial)
+    print("\nTop features by Lasso:")
+    print(lasso_importance.head(20))
+    plot_feature_importance(lasso_importance, 'Lasso Importance (1-period Return)', 'Coefficient')
+    
+    # Step 2: Select top features (e.g., top 20 from Lasso)
+    top_features = lasso_importance['Feature'].head(20).tolist()
+    X_top = X_lagged[top_features]
+    
+    # Step 3: Test top features across all rolling return horizons
+    print("\n=== Testing Top Features Across Rolling Return Horizons ===")
+    for horizon in horizons:
+        y = y_df[f'returns_{horizon}']
+        print(f"\nHorizon: {horizon}-period Forward Returns")
+        
+        # Random Forest
+        rf_importance = rf_feature_importance(X_top, y)
+        print(f"Top features by Random Forest ({horizon}-period):")
+        print(rf_importance.head(10))
+        plot_feature_importance(rf_importance, f'Random Forest Importance ({horizon}-period Returns)', 'Importance')
+
+if __name__ == "__main__":
+    main()
+!
