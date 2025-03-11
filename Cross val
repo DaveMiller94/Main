@@ -1,0 +1,161 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.linear_model import Lasso
+from sklearn.ensemble import RandomForestRegressor
+import matplotlib.pyplot as plt
+import seaborn as sns
+from itertools import combinations
+
+# 1. Data Preparation (unchanged except for return type clarification)
+def load_and_prepare_hybrid_data(file_path, max_lag=5, horizons=[1, 5, 10, 20], window=20):
+    df = pd.read_csv(file_path)
+    if 'date' not in df.columns:
+        df['date'] = pd.date_range(start='2020-01-01', periods=len(df), freq='D')
+    df.set_index('date', inplace=True)
+    
+    base_return_col = 'returns'
+    features = [col for col in df.columns if col != base_return_col]
+    X_base = df[features]
+    
+    X_engineered = pd.DataFrame(index=X_base.index)
+    
+    for feature in features:
+        for lag in range(0, max_lag + 1):
+            X_engineered[f'{feature}_lag{lag}'] = X_base[feature].shift(lag)
+        rolling_mean = X_base[feature].rolling(window=window, min_periods=1).mean()
+        rolling_std = X_base[feature].rolling(window=window, min_periods=1).std()
+        X_engineered[f'{feature}_zscore'] = (X_base[feature] - rolling_mean) / rolling_std
+        X_engineered[f'{feature}_momentum'] = X_base[feature] - X_base[feature].shift(window)
+        X_engineered[f'{feature}_volatility'] = X_base[feature].rolling(window=window, min_periods=1).std()
+        X_engineered[f'{feature}_rel_strength'] = X_base[feature] / rolling_mean - 1
+    
+    y_temp = (df[base_return_col].shift(-1).rolling(window=1, min_periods=1).sum()).loc[X_base.index]
+    corr_with_returns = X_base.corrwith(y_temp).abs().sort_values(ascending=False)
+    top_features_for_interaction = corr_with_returns.head(10).index.tolist()
+    
+    interaction_features = []
+    for feat1, feat2 in combinations(top_features_for_interaction, 2):
+        X_engineered[f'{feat1}_x_{feat2}'] = X_base[feat1] * X_base[feat2]
+        interaction_features.append(f'{feat1}_x_{feat2}')
+    
+    y_dict = {}
+    for horizon in horizons:
+        y_dict[f'returns_{horizon}'] = (df[base_return_col]
+                                      .shift(-horizon)
+                                      .rolling(window=horizon, min_periods=horizon)
+                                      .sum())
+    
+    y_df = pd.DataFrame(y_dict, index=df.index)
+    
+    valid_idx = X_engineered.dropna().index.intersection(y_df.dropna().index)
+    X_engineered = X_engineered.loc[valid_idx]
+    y_df = y_df.loc[valid_idx]
+    
+    return X_engineered, y_df, interaction_features
+
+# 2. Initial Feature Selection with Cross-Validation
+def screen_lagged_features(X, y, k=20):
+    f_selector = SelectKBest(score_func=f_regression, k=k)
+    f_selector.fit(X, y)
+    return pd.DataFrame({
+        'Feature': X.columns,
+        'F_Score': f_selector.scores_
+    }).sort_values('F_Score', ascending=False)
+
+def lasso_lagged_selection_cv(X, y, alpha=0.01, n_splits=5):
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    feature_importance_dict = {col: [] for col in X.columns}
+    
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    X_scaled = pd.DataFrame(X_scaled, index=X.index, columns=X.columns)
+    
+    for train_idx, _ in tscv.split(X):
+        X_train, y_train = X_scaled.iloc[train_idx], y.iloc[train_idx]
+        lasso = Lasso(alpha=alpha)
+        lasso.fit(X_train, y_train)
+        for col, coef in zip(X.columns, lasso.coef_):
+            feature_importance_dict[col].append(abs(coef))
+    
+    # Average importance across folds
+    feature_importance = pd.DataFrame({
+        'Feature': X.columns,
+        'Coefficient': [np.mean(feature_importance_dict[col]) for col in X.columns]
+    }).sort_values('Coefficient', ascending=False)
+    
+    return feature_importance
+
+# 3. Test Top Features with Time-Series Cross-Validation
+def rf_feature_importance_cv(X, y, n_splits=5):
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    feature_importance_dict = {col: [] for col in X.columns}
+    
+    for train_idx, test_idx in tscv.split(X):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        
+        rf = RandomForestRegressor(n_estimators=100, random_state=42)
+        rf.fit(X_train, y_train)
+        for col, imp in zip(X.columns, rf.feature_importances_):
+            feature_importance_dict[col].append(imp)
+    
+    # Average importance across folds
+    feature_importance = pd.DataFrame({
+        'Feature': X.columns,
+        'Importance': [np.mean(feature_importance_dict[col]) for col in X.columns]
+    }).sort_values('Importance', ascending=False)
+    
+    return feature_importance
+
+# 4. Visualize Results (unchanged)
+def plot_feature_importance(feature_df, title, value_col, top_n=20):
+    plt.figure(figsize=(12, 6))
+    sns.barplot(x=value_col, y='Feature', data=feature_df.head(top_n))
+    plt.title(title)
+    plt.xlabel(f'{value_col} Score')
+    plt.show()
+
+# Main execution with Cross-Validation
+def main():
+    file_path = 'your_data.csv'
+    max_lag = 5
+    horizons = [1, 5, 10, 20]
+    window = 20
+    n_splits = 5  # Number of CV folds
+    
+    X_engineered, y_df, interaction_features = load_and_prepare_hybrid_data(file_path, max_lag, horizons, window)
+    
+    # Step 1: Initial feature selection using 1-period return with CV
+    y_initial = y_df['returns_1']
+    print("=== Initial Feature Selection with Engineered Features (1-period return) ===")
+    
+    f_scores = screen_lagged_features(X_engineered, y_initial)
+    print("Top features by F-test:")
+    print(f_scores.head(20))
+    plot_feature_importance(f_scores, 'F-test Scores (1-period Return)', 'F_Score')
+    
+    lasso_importance = lasso_lagged_selection_cv(X_engineered, y_initial, n_splits=n_splits)
+    print("\nTop features by Lasso (CV):")
+    print(lasso_importance.head(20))
+    plot_feature_importance(lasso_importance, 'Lasso Importance with CV (1-period Return)', 'Coefficient')
+    
+    # Select top features
+    top_features = lasso_importance['Feature'].head(20).tolist()
+    X_top = X_engineered[top_features]
+    
+    # Step 2: Test top features across horizons with CV
+    print("\n=== Testing Top Features Across Rolling Return Horizons with CV ===")
+    for horizon in horizons:
+        y = y_df[f'returns_{horizon}']
+        print(f"\nHorizon: {horizon}-period Forward Returns")
+        
+        rf_importance = rf_feature_importance_cv(X_top, y, n_splits=n_splits)
+        print(f"Top features by Random Forest with CV ({horizon}-period):")
+        print(rf_importance.head(10))
+        plot_feature_importance(rf_importance, f'Random Forest Importance with CV ({horizon}-period Returns)', 'Importance')
+
+if __name__ == "__main__":
+    main()
