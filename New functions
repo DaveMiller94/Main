@@ -1,0 +1,318 @@
+from sklearn.feature_selection import mutual_info_regression
+
+def screen_lagged_features_mi(X, y, k=20):
+    mi_selector = SelectKBest(score_func=mutual_info_regression, k=k)
+    mi_selector.fit(X, y)
+    return pd.DataFrame({
+        'Feature': X.columns,
+        'MI_Score': mi_selector.scores_
+    }).sort_values('MI_Score', ascending=False)
+
+
+from sklearn.linear_model import ElasticNet
+
+def elastic_net_selection_cv(X, y, alpha=0.01, l1_ratio=0.5, n_splits=5):
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    feature_importance_dict = {col: [] for col in X.columns}
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    X_scaled = pd.DataFrame(X_scaled, index=X.index, columns=X.columns)
+    
+    for train_idx, _ in tscv.split(X):
+        X_train, y_train = X_scaled.iloc[train_idx], y.iloc[train_idx]
+        enet = ElasticNet(alpha=alpha, l1_ratio=l1_ratio)
+        enet.fit(X_train, y_train)
+        for col, coef in zip(X.columns, enet.coef_):
+            feature_importance_dict[col].append(abs(coef))
+    
+    feature_importance = pd.DataFrame({
+        'Feature': X.columns,
+        'Coefficient': [np.mean(feature_importance_dict[col]) for col in X.columns]
+    }).sort_values('Coefficient', ascending=False)
+    return feature_importance
+
+def rf_feature_stability(X, y, window_size=252, n_trees=100):  # 252 ~ 1 year of daily data
+    feature_importance_dict = {col: [] for col in X.columns}
+    for start in range(0, len(X) - window_size, window_size):
+        X_window = X.iloc[start:start + window_size]
+        y_window = y.iloc[start:start + window_size]
+        rf = RandomForestRegressor(n_estimators=n_trees, random_state=42)
+        rf.fit(X_window, y_window)
+        for col, imp in zip(X.columns, rf.feature_importances_):
+            feature_importance_dict[col].append(imp)
+    return pd.DataFrame(feature_importance_dict).mean().sort_values(ascending=False)
+
+
+
+from sklearn.decomposition import PCA
+
+def apply_pca(X, n_components=10):
+    pca = PCA(n_components=n_components)
+    X_pca = pca.fit_transform(X)
+    explained_variance = np.sum(pca.explained_variance_ratio_)
+    print(f"Explained Variance Ratio (top {n_components} components): {explained_variance:.4f}")
+    return pd.DataFrame(X_pca, index=X.index)
+
+# 3. New: RFE with Time-Series CV
+def rfe_selection_cv(X, y, estimator=LinearRegression(), n_features_to_select=20, n_splits=5):
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    feature_ranking_dict = {col: [] for col in X.columns}
+    
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    X_scaled = pd.DataFrame(X_scaled, index=X.index, columns=X.columns)
+    
+    for train_idx, _ in tscv.split(X):
+        X_train, y_train = X_scaled.iloc[train_idx], y.iloc[train_idx]
+        rfe = RFE(estimator=estimator, n_features_to_select=n_features_to_select)
+        rfe.fit(X_train, y_train)
+        # Store rankings (1 = selected, higher = eliminated earlier)
+        for col, rank in zip(X.columns, rfe.ranking_):
+            feature_ranking_dict[col].append(rank)
+    
+    # Average rankings across folds (lower is better)
+    feature_ranking = pd.DataFrame({
+        'Feature': X.columns,
+        'RFE_Ranking': [np.mean(feature_ranking_dict[col]) for col in X.columns]
+    }).sort_values('RFE_Ranking', ascending=True)  # Lower rank = more important
+    return feature_ranking
+
+# 4. New: XGBoost Feature Importance with Time-Series CV
+def xgb_feature_importance_cv(X, y, n_splits=5):
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    feature_importance_dict = {col: [] for col in X.columns}
+    
+    for train_idx, test_idx in tscv.split(X):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        
+        xgb_model = xgb.XGBRegressor(random_state=42, eval_metric='rmse')
+        xgb_model.fit(X_train, y_train)
+        for col, imp in zip(X.columns, 
+xgb_model.feature_importances_):
+            feature_importance_dict[col].append(imp)
+    
+    feature_importance = pd.DataFrame({
+        'Feature': X.columns,
+        'Importance': [np.mean(feature_importance_dict[col]) for col in X.columns]
+    }).sort_values('Importance', ascending=False)
+    return feature_importance
+
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, f_regression, RFE
+from sklearn.linear_model import Lasso, LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+import xgboost as xgb
+import matplotlib.pyplot as plt
+import seaborn as sns
+from itertools import combinations
+
+# [Your existing function: load_and_prepare_hybrid_data remains unchanged]
+
+# Updated: Filter interactions based on importance and correlation
+def filter_interactions(X, feature_importance_df, importance_col='Importance', threshold=0.1, corr_threshold=0.9):
+    """
+    Remove interaction terms if their importance is too close to parent features
+    or if they're highly correlated with them.
+    """
+    # Separate base and interaction features
+    base_features = [col for col in X.columns if '_x_' not in col]
+    interaction_features = [col for col in X.columns if '_x_' in col]
+    
+    # Map interactions to their parent features
+    interaction_to_parents = {}
+    for inter in interaction_features:
+        feat1, feat2 = inter.split('_x_')
+        interaction_to_parents[inter] = [feat1, feat2]
+    
+    # Get importance dictionary
+    importance_dict = feature_importance_df.set_index('Feature')[importance_col].to_dict()
+    
+    # Compute correlations
+    corr_matrix = X.corr()
+    
+    # Filter interactions
+    filtered_features = base_features.copy()
+    for inter in interaction_features:
+        parents = interaction_to_parents[inter]
+        parent_importances = [importance_dict.get(p, 0) for p in parents if p in importance_dict]
+        inter_importance = importance_dict.get(inter, 0)
+        
+        # Check if interaction importance is too close to parents
+        if parent_importances:
+            max_parent_imp = max(parent_importances)
+            imp_diff = abs(inter_importance - max_parent_imp) / max_parent_imp
+            too_similar = imp_diff < threshold
+        
+        # Check correlation with parents
+        high_corr = False
+        for parent in parents:
+            if parent in X.columns and inter in X.columns:
+                corr = abs(corr_matrix.loc[inter, parent])
+                if corr > corr_threshold:
+                    high_corr = True
+                    break
+        
+        # Keep interaction only if it adds unique value
+        if not (too_similar or high_corr):
+            filtered_features.append(inter)
+    
+    return filtered_features
+
+# Existing feature selection functions (slightly modified to return filtered results)
+def screen_lagged_features(X, y, k=20):
+    f_selector = SelectKBest(score_func=f_regression, k='all')  # Get scores for all features
+    f_selector.fit(X, y)
+    feature_df = pd.DataFrame({
+        'Feature': X.columns,
+        'F_Score': f_selector.scores_
+    }).sort_values('F_Score', ascending=False)
+    filtered_features = filter_interactions(X, feature_df, 'F_Score')
+    return feature_df[feature_df['Feature'].isin(filtered_features)].head(k)
+
+def lasso_lagged_selection_cv(X, y, alpha=0.01, n_splits=5):
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    feature_importance_dict = {col: [] for col in X.columns}
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    X_scaled = pd.DataFrame(X_scaled, index=X.index, columns=X.columns)
+    
+    for train_idx, _ in tscv.split(X):
+        X_train, y_train = X_scaled.iloc[train_idx], y.iloc[train_idx]
+        lasso = Lasso(alpha=alpha)
+        lasso.fit(X_train, y_train)
+        for col, coef in zip(X.columns, lasso.coef_):
+            feature_importance_dict[col].append(abs(coef))
+    
+    feature_importance = pd.DataFrame({
+        'Feature': X.columns,
+        'Coefficient': [np.mean(feature_importance_dict[col]) for col in X.columns]
+    }).sort_values('Coefficient', ascending=False)
+    filtered_features = filter_interactions(X, feature_importance, 'Coefficient')
+    return feature_importance[feature_importance['Feature'].isin(filtered_features)]
+
+def rf_feature_importance_cv(X, y, n_splits=5):
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    feature_importance_dict = {col: [] for col in X.columns}
+    
+    for train_idx, test_idx in tscv.split(X):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        rf = RandomForestRegressor(n_estimators=100, random_state=42)
+        rf.fit(X_train, y_train)
+        for col, imp in zip(X.columns, rf.feature_importances_):
+            feature_importance_dict[col].append(imp)
+    
+    feature_importance = pd.DataFrame({
+        'Feature': X.columns,
+        'Importance': [np.mean(feature_importance_dict[col]) for col in X.columns]
+    }).sort_values('Importance', ascending=False)
+    filtered_features = filter_interactions(X, feature_importance, 'Importance')
+    return feature_importance[feature_importance['Feature'].isin(filtered_features)]
+
+def rfe_selection_cv(X, y, estimator=LinearRegression(), n_features_to_select=20, n_splits=5):
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    feature_ranking_dict = {col: [] for col in X.columns}
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    X_scaled = pd.DataFrame(X_scaled, index=X.index, columns=X.columns)
+    
+    for train_idx, _ in tscv.split(X):
+        X_train, y_train = X_scaled.iloc[train_idx], y.iloc[train_idx]
+        rfe = RFE(estimator=estimator, n_features_to_select=n_features_to_select)
+        rfe.fit(X_train, y_train)
+        for col, rank in zip(X.columns, rfe.ranking_):
+            feature_ranking_dict[col].append(rank)
+    
+    feature_ranking = pd.DataFrame({
+        'Feature': X.columns,
+        'RFE_Ranking': [np.mean(feature_ranking_dict[col]) for col in X.columns]
+    }).sort_values('RFE_Ranking', ascending=True)
+    filtered_features = filter_interactions(X, feature_ranking, 'RFE_Ranking')
+    return feature_ranking[feature_ranking['Feature'].isin(filtered_features)]
+
+def xgb_feature_importance_cv(X, y, n_splits=5):
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    feature_importance_dict = {col: [] for col in X.columns}
+    
+    for train_idx, test_idx in tscv.split(X):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        xgb_model = xgb.XGBRegressor(random_state=42, eval_metric='rmse')
+        xgb_model.fit(X_train, y_train)
+        for col, imp in zip(X.columns, xgb_model.feature_importances_):
+            feature_importance_dict[col].append(imp)
+    
+    feature_importance = pd.DataFrame({
+        'Feature': X.columns,
+        'Importance': [np.mean(feature_importance_dict[col]) for col in X.columns]
+    }).sort_values('Importance', ascending=False)
+    filtered_features = filter_interactions(X, feature_importance, 'Importance')
+    return feature_importance[feature_importance['Feature'].isin(filtered_features)]
+
+# Visualize Results (unchanged)
+def plot_feature_importance(feature_df, title, value_col, top_n=20):
+    plt.figure(figsize=(12, 6))
+    sns.barplot(x=value_col, y='Feature', data=feature_df.head(top_n))
+    plt.title(title)
+    plt.xlabel(f'{value_col} Score')
+    plt.show()
+
+# Updated main function
+def main():
+    file_path = 'your_data.csv'
+    max_lag = 5
+    horizons = [1, 5, 10, 20]
+    window = 20
+    n_splits = 5
+    
+    X_engineered, y_df, interaction_features = load_and_prepare_hybrid_data(file_path, max_lag, horizons, window)
+    
+    y_initial = y_df['returns_1']
+    print("=== Initial Feature Selection with Engineered Features (1-period return) ===")
+    
+    f_scores = screen_lagged_features(X_engineered, y_initial)
+    print("Top features by F-test (filtered):")
+    print(f_scores.head(20))
+    plot_feature_importance(f_scores, 'F-test Scores (1-period Return, Filtered)', 'F_Score')
+    
+    lasso_importance = lasso_lagged_selection_cv(X_engineered, y_initial, n_splits=n_splits)
+    print("\nTop features by Lasso (CV, filtered):")
+    print(lasso_importance.head(20))
+    plot_feature_importance(lasso_importance, 'Lasso Importance with CV (1-period Return, Filtered)', 'Coefficient')
+    
+    rfe_importance = rfe_selection_cv(X_engineered, y_initial, estimator=LinearRegression(), n_features_to_select=20, n_splits=n_splits)
+    print("\nTop features by RFE (CV, Linear Regression, filtered):")
+    print(rfe_importance.head(20))
+    plot_feature_importance(rfe_importance, 'RFE Ranking with CV (1-period Return, Filtered)', 'RFE_Ranking')
+    
+    xgb_importance = xgb_feature_importance_cv(X_engineered, y_initial, n_splits=n_splits)
+    print("\nTop features by XGBoost (CV, filtered):")
+    print(xgb_importance.head(20))
+    plot_feature_importance(xgb_importance, 'XGBoost Importance with CV (1-period Return, Filtered)', 'Importance')
+    
+    # Select top features (using XGBoost as example)
+    top_features = xgb_importance['Feature'].head(20).tolist()
+    X_top = X_engineered[top_features]
+    
+    print("\n=== Testing Top Features Across Rolling Return Horizons with CV ===")
+    for horizon in horizons:
+        y = y_df[f'returns_{horizon}']
+        print(f"\nHorizon: {horizon}-period Forward Returns")
+        
+        rf_importance = rf_feature_importance_cv(X_top, y, n_splits=n_splits)
+        print(f"Top features by Random Forest with CV ({horizon}-period, filtered):")
+        print(rf_importance.head(10))
+        plot_feature_importance(rf_importance, f'Random Forest Importance with CV ({horizon}-period Returns, Filtered)', 'Importance')
+        
+        xgb_importance_horizon = xgb_feature_importance_cv(X_top, y, n_splits=n_splits)
+        print(f"Top features by XGBoost with CV ({horizon}-period, filtered):")
+        print(xgb_importance_horizon.head(10))
+        plot_feature_importance(xgb_importance_horizon, f'XGBoost Importance with CV ({horizon}-period Returns, Filtered)', 'Importance')
+
+if __name__ == "__main__":
+    main()
