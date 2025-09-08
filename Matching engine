@@ -1,0 +1,350 @@
+
+"""
+Inter-Client Matching Engine (Two-File Input, SEDOL- and Currency-aware)
+-------------------------------------------------------------------------
+
+Inputs
+------
+1) Blotter (client orders after cash in/out), CSV with columns:
+   - client_id           : str
+   - sedol               : str   (share class / series identifier)
+   - fund_id             : str
+   - currency            : str   (fund dealing currency for this SEDOL)
+   - nav                 : float (transfer/dealing price per unit for this SEDOL on the effective date)
+   - order_value         : float (value in fund currency; +buy, -sell)
+   - order_units         : float (optional; if blank, computed from value/nav)
+   - notes               : str   (optional)
+
+2) Holdings vs Targets extract (per client-SEDOL), CSV with columns:
+   - client_id           : str
+   - sedol               : str
+   - fund_id             : str
+   - currency            : str   (must match the SEDOL’s currency in blotter if present)
+   - nav                 : float (use same pricing date as blotter; single NAV per SEDOL)
+   - position_value      : float (current holding value in fund currency)
+   - current_weight      : float (0..1, optional if position_value present)
+   - target_weight       : float (0..1)  (required unless target_value provided)
+   - portfolio_value     : float (required if weights are used)
+   - target_value        : float (optional; if blank compute = target_weight * portfolio_value)
+
+Notes
+-----
+- Matching is isolated per SEDOL (series/share class). No cross-SEDOL offsets.
+- All values are assumed in the fund currency (no FX here). NAV drives units rounding.
+- Priority:
+  1) Net the blotter orders (buys vs sells) within SEDOL.
+  2) If residual buy -> source from overweights from Holdings for that SEDOL.
+     If residual sell -> allocate to underweights from Holdings for that SEDOL.
+- Outputs:
+  - transactions_internal.csv : internal SEDOL transfers (from_client -> to_client)
+  - net_external_per_sedol.csv: net external subscribe/redeem per SEDOL (residual after internalizing)
+  - post_trade_summary.csv    : post-trade deviation from target per client/SEDOL
+
+CLI
+---
+python interclient_matching_engine_twofile.py blotter.csv holdings.csv \
+  --transactions_out transactions_internal.csv \
+  --external_out net_external_per_sedol.csv \
+  --summary_out post_trade_summary.csv \
+  --unit_decimal_places 6 \
+  --min_ticket_value 0
+"""
+
+from __future__ import annotations
+import math
+import pandas as pd
+from collections import deque
+from typing import Dict, List, Tuple
+
+def _round_units(units: float, dp: int) -> float:
+    return round(units, dp)
+
+def _ensure_series_nav_consistency(df: pd.DataFrame, key_cols=("sedol",)) -> None:
+    # Ensures a single NAV per SEDOL across blotter + holdings
+    for keys, g in df.groupby(list(key_cols), sort=False):
+        navs = pd.to_numeric(g["nav"], errors="coerce").dropna().unique().tolist()
+        if len(navs) != 1:
+            raise ValueError(f"Multiple NAVs detected for {key_cols}={keys}: {navs}. Provide a single NAV per SEDOL.")
+
+def _compute_target_value(row: pd.Series) -> float:
+    if pd.notnull(row.get("target_value")):
+        return float(row["target_value"])
+    if pd.notnull(row.get("target_weight")) and pd.notnull(row.get("portfolio_value")):
+        return float(row["target_weight"]) * float(row["portfolio_value"])
+    raise ValueError("Provide target_value or (target_weight AND portfolio_value) for each holdings row.")
+
+def _greedy_match(
+    buyers: List[Dict], sellers: List[Dict], price: float, unit_dp: int, min_ticket_value: float, reason: str
+) -> Tuple[List[Dict], List[Dict], List[Dict], Dict[str, float]]:
+    """
+    Match buyers and sellers (value-based) using a largest-first greedy approach.
+    Returns transactions, residual buyers/sellers, and per-client value deltas.
+    """
+    buyers_q = deque(sorted(buyers, key=lambda x: x["remaining_value"], reverse=True))
+    sellers_q = deque(sorted(sellers, key=lambda x: x["remaining_value"], reverse=True))
+    txns = []
+    deltas: Dict[str, float] = {}
+
+    while buyers_q and sellers_q:
+        b = buyers_q[0]
+        s = sellers_q[0]
+        trade_value_raw = min(b["remaining_value"], s["remaining_value"])
+
+        if trade_value_raw < max(min_ticket_value, 0.0):
+            # Skip smaller side to avoid micro tickets
+            if b["remaining_value"] <= s["remaining_value"]:
+                buyers_q.popleft()
+            else:
+                sellers_q.popleft()
+            continue
+
+        units = trade_value_raw / price if price != 0 else 0.0
+        units = _round_units(units, unit_dp)
+        if units <= 0:
+            if b["remaining_value"] <= s["remaining_value"]:
+                buyers_q.popleft()
+            else:
+                sellers_q.popleft()
+            continue
+
+        trade_value = units * price
+
+        b["remaining_value"] -= trade_value
+        s["remaining_value"] -= trade_value
+
+        txns.append({
+            "from_client": s["client_id"],
+            "to_client": b["client_id"],
+            "price": price,
+            "units": units,
+            "value": trade_value,
+            "reason": reason
+        })
+
+        deltas[b["client_id"]] = deltas.get(b["client_id"], 0.0) + trade_value
+        deltas[s["client_id"]] = deltas.get(s["client_id"], 0.0) - trade_value
+
+        if b["remaining_value"] <= 1e-9:
+            buyers_q.popleft()
+        if s["remaining_value"] <= 1e-9:
+            sellers_q.popleft()
+
+    buyers_resid = [x for x in list(buyers_q) if x["remaining_value"] > 1e-9]
+    sellers_resid = [x for x in list(sellers_q) if x["remaining_value"] > 1e-9]
+    return txns, buyers_resid, sellers_resid, deltas
+
+def run_matching_engine_twofile(
+    blotter_csv: str,
+    holdings_csv: str,
+    transactions_out: str = "transactions_internal.csv",
+    external_out: str = "net_external_per_sedol.csv",
+    summary_out: str = "post_trade_summary.csv",
+    unit_decimal_places: int = 6,
+    min_ticket_value: float = 0.0
+):
+    """
+    Execute matching per SEDOL using blotter orders and holdings vs targets.
+    """
+    blotter = pd.read_csv(blotter_csv)
+    holdings = pd.read_csv(holdings_csv)
+
+    # Basic validations
+    req_blotter = {"client_id","sedol","fund_id","currency","nav","order_value"}
+    if not req_blotter.issubset(set(blotter.columns)):
+        raise ValueError(f"Blotter missing columns: {req_blotter - set(blotter.columns)}")
+
+    # Holdings must have either target_value OR (target_weight & portfolio_value)
+    req_hold_weights = {"client_id","sedol","fund_id","currency","nav","position_value","target_weight","portfolio_value"}
+    req_hold_targetval = {"client_id","sedol","fund_id","currency","nav","position_value","target_value"}
+    if not (req_hold_weights.issubset(set(holdings.columns)) or req_hold_targetval.issubset(set(holdings.columns))):
+        raise ValueError("Holdings must include either target_value OR (target_weight AND portfolio_value) plus position_value.")
+
+    # Compute order_units if absent
+    if "order_units" not in blotter.columns:
+        blotter["order_units"] = pd.NA
+    blotter["order_units"] = blotter.apply(
+        lambda r: (float(r["order_value"]) / float(r["nav"])) if pd.isna(r["order_units"]) and r["nav"] != 0 else r["order_units"],
+        axis=1
+    )
+
+    # Ensure single NAV per SEDOL across both files
+    _ensure_series_nav_consistency(pd.concat([
+        blotter[["sedol","nav"]],
+        holdings[["sedol","nav"]]
+    ], ignore_index=True), key_cols=("sedol",))
+
+    # Compute target_value if needed
+    if "target_value" not in holdings.columns:
+        holdings["target_value"] = holdings.apply(_compute_target_value, axis=1)
+
+    # Prepare outputs
+    all_txns = []
+    external_rows = []
+    post_trade_records = []
+
+    # Work per SEDOL (series)
+    for sedol, bgroup in blotter.groupby("sedol", sort=False):
+        # Join holdings for this SEDOL
+        hgroup = holdings[holdings["sedol"] == sedol]
+        if hgroup.empty:
+            raise ValueError(f"No holdings rows for sedol={sedol}.")
+
+        # For reporting, derive fund_id and currency from holdings (SEDOL should imply both)
+        fund_id = hgroup["fund_id"].mode().iat[0]
+        currency = hgroup["currency"].mode().iat[0]
+
+        # NAV (already checked unique)
+        nav = float(pd.concat([bgroup["nav"], hgroup["nav"]]).dropna().unique()[0])
+
+        # Value delta tracker per client for post-trade
+        value_delta: Dict[str, float] = {cid: 0.0 for cid in hgroup["client_id"].unique()}
+        for cid in bgroup["client_id"].unique():
+            if cid not in value_delta:
+                value_delta[cid] = 0.0
+
+        # Step 1: Net blotter flows
+        buyers = [{"client_id": r.client_id, "remaining_value": max(float(r.order_value), 0.0)}
+                  for r in bgroup.itertuples(index=False) if float(r.order_value) > 0]
+        sellers = [{"client_id": r.client_id, "remaining_value": max(-float(r.order_value), 0.0)}
+                   for r in bgroup.itertuples(index=False) if float(r.order_value) < 0]
+
+        txns_flow, resid_buys, resid_sells, deltas = _greedy_match(
+            buyers, sellers, nav, unit_decimal_places, min_ticket_value, reason="flow-net"
+        )
+        for t in txns_flow:
+            t.update({"sedol": sedol, "fund_id": fund_id, "currency": currency})
+        all_txns.extend(txns_flow)
+        for k, v in deltas.items():
+            value_delta[k] = value_delta.get(k, 0.0) + v
+
+        total_buy_resid = sum(x["remaining_value"] for x in resid_buys)
+        total_sell_resid = sum(x["remaining_value"] for x in resid_sells)
+
+        # Compute post-flow values for deviation calc
+        starting_values = hgroup.set_index("client_id")["position_value"].to_dict()
+        def post_flow_value(cid: str) -> float:
+            return float(starting_values.get(cid, 0.0) + value_delta.get(cid, 0.0))
+
+        clients_all = sorted(set(list(starting_values.keys()) + list(value_delta.keys())))
+        targets = hgroup.set_index("client_id")["target_value"].to_dict()
+
+        if total_buy_resid > 1e-9:
+            # Source from overweights
+            overweights = []
+            for cid in clients_all:
+                tgt = float(targets.get(cid, 0.0))
+                ow = post_flow_value(cid) - tgt
+                if ow > 1e-9:
+                    overweights.append({"client_id": cid, "remaining_value": ow})
+            if overweights:
+                txns_ow, resid_buys2, resid_sells2, deltas2 = _greedy_match(
+                    resid_buys, overweights, nav, unit_decimal_places, min_ticket_value, reason="offset-overweight"
+                )
+                for t in txns_ow:
+                    t.update({"sedol": sedol, "fund_id": fund_id, "currency": currency})
+                all_txns.extend(txns_ow)
+                for k, v in deltas2.items():
+                    value_delta[k] = value_delta.get(k, 0.0) + v
+                resid_buy_after_ow = sum(x["remaining_value"] for x in resid_buys2)
+                if resid_buy_after_ow > 1e-9:
+                    units = round(resid_buy_after_ow / nav, unit_decimal_places) if nav != 0 else 0.0
+                    external_rows.append({
+                        "sedol": sedol, "fund_id": fund_id, "currency": currency,
+                        "side": "External Subscribe", "price": nav,
+                        "units": units, "value": units * nav
+                    })
+            else:
+                units = round(total_buy_resid / nav, unit_decimal_places) if nav != 0 else 0.0
+                external_rows.append({
+                    "sedol": sedol, "fund_id": fund_id, "currency": currency,
+                    "side": "External Subscribe", "price": nav,
+                    "units": units, "value": units * nav
+                })
+
+        elif total_sell_resid > 1e-9:
+            # Allocate to underweights
+            underweights = []
+            for cid in clients_all:
+                tgt = float(targets.get(cid, 0.0))
+                uw = tgt - post_flow_value(cid)
+                if uw > 1e-9:
+                    underweights.append({"client_id": cid, "remaining_value": uw})
+            if underweights:
+                txns_uw, resid_buys2, resid_sells2, deltas2 = _greedy_match(
+                    underweights, resid_sells, nav, unit_decimal_places, min_ticket_value, reason="offset-underweight"
+                )
+                for t in txns_uw:
+                    t.update({"sedol": sedol, "fund_id": fund_id, "currency": currency})
+                all_txns.extend(txns_uw)
+                for k, v in deltas2.items():
+                    value_delta[k] = value_delta.get(k, 0.0) + v
+                resid_sell_after_uw = sum(x["remaining_value"] for x in resid_sells2)
+                if resid_sell_after_uw > 1e-9:
+                    units = round(resid_sell_after_uw / nav, unit_decimal_places) if nav != 0 else 0.0
+                    external_rows.append({
+                        "sedol": sedol, "fund_id": fund_id, "currency": currency,
+                        "side": "External Redeem", "price": nav,
+                        "units": units, "value": units * nav
+                    })
+            else:
+                units = round(total_sell_resid / nav, unit_decimal_places) if nav != 0 else 0.0
+                external_rows.append({
+                    "sedol": sedol, "fund_id": fund_id, "currency": currency,
+                    "side": "External Redeem", "price": nav,
+                    "units": units, "value": units * nav
+                })
+
+        # Post-trade summary for all clients in this SEDOL
+        for cid in clients_all:
+            ptv = post_flow_value(cid)
+            tgt = float(targets.get(cid, 0.0))
+            dev = ptv - tgt
+            dev_pct = (dev / tgt) if tgt != 0 else math.nan
+            post_trade_records.append({
+                "client_id": cid, "sedol": sedol, "fund_id": fund_id, "currency": currency,
+                "price": nav,
+                "post_trade_value": ptv,
+                "target_value": tgt,
+                "deviation_value": dev,
+                "deviation_pct": dev_pct
+            })
+
+    # Build DataFrames and optionally write to CSVs
+    txns_df = pd.DataFrame(all_txns, columns=[
+        "sedol","fund_id","currency","from_client","to_client","price","units","value","reason"
+    ])
+    external_df = pd.DataFrame(external_rows, columns=[
+        "sedol","fund_id","currency","side","price","units","value"
+    ])
+    summary_df = pd.DataFrame(post_trade_records, columns=[
+        "client_id","sedol","fund_id","currency","price",
+        "post_trade_value","target_value","deviation_value","deviation_pct"
+    ])
+
+    txns_df.to_csv(transactions_out, index=False)
+    external_df.to_csv(external_out, index=False)
+    summary_df.to_csv(summary_out, index=False)
+
+    return txns_df, external_df, summary_df
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Inter-client matching engine (two-file, SEDOL-aware).")
+    ap.add_argument("blotter_csv", help="Blotter orders CSV")
+    ap.add_argument("holdings_csv", help="Holdings vs target CSV")
+    ap.add_argument("--transactions_out", default="transactions_internal.csv")
+    ap.add_argument("--external_out", default="net_external_per_sedol.csv")
+    ap.add_argument("--summary_out", default="post_trade_summary.csv")
+    ap.add_argument("--unit_decimal_places", type=int, default=6)
+    ap.add_argument("--min_ticket_value", type=float, default=0.0)
+    args = ap.parse_args()
+
+    run_matching_engine_twofile(
+        args.blotter_csv, args.holdings_csv,
+        transactions_out=args.transactions_out,
+        external_out=args.external_out,
+        summary_out=args.summary_out,
+        unit_decimal_places=args.unit_decimal_places,
+        min_ticket_value=args.min_ticket_value
+    )
