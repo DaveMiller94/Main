@@ -1,0 +1,647 @@
+positioning_df   # many positioning indicators
+returns_df       # market index returns
+macro_df         # optional macro features
+market_df        # optional market-derived features
+
+asset = "SPX"
+asset_returns = returns_df[asset]
+
+import numpy as np
+import pandas as pd
+
+def create_forward_return_target(asset_returns, horizon=1):
+    """
+    Creates forward compounded return over a given horizon.
+
+    asset_returns:
+        Periodic return series, e.g. daily, weekly, or monthly returns.
+
+    horizon:
+        Number of periods ahead.
+    """
+
+    fwd_return = (
+        (1 + asset_returns)
+        .rolling(horizon)
+        .apply(np.prod, raw=True)
+        .shift(-horizon)
+        - 1
+    )
+
+    return fwd_return.rename(f"fwd_return_{horizon}")
+
+
+
+y_1m = create_forward_return_target(asset_returns, horizon=1)
+y_3m = create_forward_return_target(asset_returns, horizon=3)
+y_6m = create_forward_return_target(asset_returns, horizon=6)
+
+
+def rolling_zscore(df, window=36):
+    return (df - df.rolling(window).mean()) / df.rolling(window).std()
+
+def rolling_percentile_rank(df, window=60):
+    def pct_rank(x):
+        return pd.Series(x).rank(pct=True).iloc[-1]
+
+    return df.rolling(window).apply(pct_rank, raw=False)
+
+positioning_z = rolling_zscore(positioning_df, window=36)
+positioning_pct = rolling_percentile_rank(positioning_df, window=60)
+
+
+positioning_z = positioning_z.shift(1)
+positioning_pct = positioning_pct.shift(1)
+
+def test_forward_return_prediction(X, y, n_quantiles=5):
+    """
+    Tests each positioning signal against forward returns.
+
+    Returns:
+        IC, quantile spread, top/bottom quantile returns.
+    """
+
+    rows = []
+
+    for col in X.columns:
+        temp = pd.concat([X[col], y], axis=1).dropna()
+        temp.columns = ["signal", "target"]
+
+        if len(temp) < 60:
+            continue
+
+        if temp["signal"].nunique() < n_quantiles:
+            continue
+
+        temp["quantile"] = pd.qcut(
+            temp["signal"],
+            q=n_quantiles,
+            labels=False,
+            duplicates="drop"
+        )
+
+        q_returns = temp.groupby("quantile")["target"].mean()
+
+        if len(q_returns) < 2:
+            continue
+
+        ic = temp["signal"].corr(temp["target"])
+
+        rows.append({
+            "signal": col,
+            "ic": ic,
+            "top_quantile_return": q_returns.iloc[-1],
+            "bottom_quantile_return": q_returns.iloc[0],
+            "top_minus_bottom": q_returns.iloc[-1] - q_returns.iloc[0],
+            "abs_spread": abs(q_returns.iloc[-1] - q_returns.iloc[0]),
+            "observations": len(temp)
+        })
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values("abs_spread", ascending=False)
+        .reset_index(drop=True)
+    )
+
+forward_return_results = test_forward_return_prediction(
+    positioning_pct,
+    y_3m,
+    n_quantiles=5
+)
+
+forward_return_results.head(20)
+
+
+Positive top_minus_bottom:
+    high positioning tends to precede stronger returns.
+
+Negative top_minus_bottom:
+    high positioning tends to precede weaker returns.
+    This is often a crowding/reversal signal.
+
+
+
+
+def test_directional_accuracy(X, y):
+    """
+    Tests whether high/low signal values predict positive future returns.
+
+    Uses simple median split.
+    """
+
+    rows = []
+
+    y_direction = (y > 0).astype(int)
+
+    for col in X.columns:
+        temp = pd.concat([X[col], y_direction], axis=1).dropna()
+        temp.columns = ["signal", "direction"]
+
+        if len(temp) < 60:
+            continue
+
+        median_signal = temp["signal"].median()
+
+        temp["high_signal"] = temp["signal"] > median_signal
+
+        hit_rate_high = temp.loc[temp["high_signal"], "direction"].mean()
+        hit_rate_low = temp.loc[~temp["high_signal"], "direction"].mean()
+
+        rows.append({
+            "signal": col,
+            "hit_rate_high_signal": hit_rate_high,
+            "hit_rate_low_signal": hit_rate_low,
+            "hit_rate_spread": hit_rate_high - hit_rate_low,
+            "abs_hit_rate_spread": abs(hit_rate_high - hit_rate_low),
+            "observations": len(temp)
+        })
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values("abs_hit_rate_spread", ascending=False)
+        .reset_index(drop=True)
+    )
+
+direction_results = test_directional_accuracy(
+    positioning_pct,
+    y_3m
+)
+
+direction_results.head(20)
+
+
+If positioning is extremely crowded and recent returns were strong,
+future returns may weaken.
+
+If positioning is extremely underowned and recent returns were weak,
+future returns may rebound.
+
+def trailing_return(asset_returns, window=3):
+    return (
+        (1 + asset_returns)
+        .rolling(window)
+        .apply(np.prod, raw=True)
+        - 1
+    ).rename(f"trailing_return_{window}")
+
+trailing_3m = trailing_return(asset_returns, window=3)
+
+
+def test_positioning_reversal(
+    positioning_pct,
+    trailing_returns,
+    forward_returns,
+    crowded_threshold=0.9,
+    underowned_threshold=0.1
+):
+    """
+    Tests whether crowded/underowned positioning predicts reversals.
+
+    Crowded reversal:
+        positioning > 90th percentile and trailing return > 0
+
+    Underowned rebound:
+        positioning < 10th percentile and trailing return < 0
+    """
+
+    rows = []
+
+    for col in positioning_pct.columns:
+        temp = pd.concat(
+            [
+                positioning_pct[col],
+                trailing_returns,
+                forward_returns
+            ],
+            axis=1
+        ).dropna()
+
+        temp.columns = ["positioning", "trailing_return", "forward_return"]
+
+        if len(temp) < 60:
+            continue
+
+        crowded_long = (
+            (temp["positioning"] >= crowded_threshold) &
+            (temp["trailing_return"] > 0)
+        )
+
+        underowned_weak = (
+            (temp["positioning"] <= underowned_threshold) &
+            (temp["trailing_return"] < 0)
+        )
+
+        normal = ~(crowded_long | underowned_weak)
+
+        crowded_forward_return = temp.loc[crowded_long, "forward_return"].mean()
+        underowned_forward_return = temp.loc[underowned_weak, "forward_return"].mean()
+        normal_forward_return = temp.loc[normal, "forward_return"].mean()
+
+        rows.append({
+            "signal": col,
+            "crowded_forward_return": crowded_forward_return,
+            "underowned_forward_return": underowned_forward_return,
+            "normal_forward_return": normal_forward_return,
+            "crowded_minus_normal": crowded_forward_return - normal_forward_return,
+            "underowned_minus_normal": underowned_forward_return - normal_forward_return,
+            "crowded_obs": crowded_long.sum(),
+            "underowned_obs": underowned_weak.sum(),
+            "normal_obs": normal.sum()
+        })
+
+    return pd.DataFrame(rows)
+
+
+reversal_results = test_positioning_reversal(
+    positioning_pct=positioning_pct,
+    trailing_returns=trailing_3m,
+    forward_returns=y_3m,
+    crowded_threshold=0.9,
+    underowned_threshold=0.1
+)
+
+reversal_results.sort_values("crowded_minus_normal").head(20)
+
+Negative crowded_minus_normal:
+    crowded long positioning after a rally tends to underperform.
+    This is a useful reversal warning.
+
+Positive underowned_minus_normal:
+    underowned positioning after weakness tends to rebound.
+    This is a useful contrarian signal.
+
+
+
+def create_forward_volatility_target(asset_returns, horizon=3):
+    """
+    Forward realized volatility over horizon.
+    """
+
+    fwd_vol = (
+        asset_returns
+        .rolling(horizon)
+        .std()
+        .shift(-horizon)
+    )
+
+    return fwd_vol.rename(f"fwd_vol_{horizon}")
+
+fwd_vol_3m = create_forward_volatility_target(asset_returns, horizon=3)
+
+vol_results = test_forward_return_prediction(
+    positioning_pct,
+    fwd_vol_3m,
+    n_quantiles=5
+)
+
+vol_results.head(20)
+
+Positive top_minus_bottom:
+    high positioning is associated with higher future volatility.
+
+Negative top_minus_bottom:
+    high positioning is associated with lower future volatility.
+
+
+def create_forward_drawdown_target(asset_returns, horizon=3):
+    """
+    Forward max drawdown over the next horizon.
+    """
+
+    def max_drawdown(x):
+        wealth = np.cumprod(1 + x)
+        peak = np.maximum.accumulate(wealth)
+        dd = wealth / peak - 1
+        return dd.min()
+
+    fwd_dd = (
+        asset_returns
+        .rolling(horizon)
+        .apply(max_drawdown, raw=True)
+        .shift(-horizon)
+    )
+
+    return fwd_dd.rename(f"fwd_drawdown_{horizon}")
+
+fwd_dd_3m = create_forward_drawdown_target(asset_returns, horizon=3)
+
+
+drawdown_results = test_forward_return_prediction(
+    positioning_pct,
+    fwd_dd_3m,
+    n_quantiles=5
+)
+
+drawdown_results.head(20)
+
+More negative top_quantile_return:
+    high positioning is associated with worse future drawdowns.
+
+Negative top_minus_bottom:
+    high positioning is riskier than low positioning.
+
+
+
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error
+
+def walk_forward_model_score(X, y, model=None, n_splits=5):
+    """
+    Walk-forward regression score.
+    """
+
+    if model is None:
+        model = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", Ridge(alpha=10))
+        ])
+
+    temp = pd.concat([X, y], axis=1).dropna()
+    X_clean = temp[X.columns]
+    y_clean = temp[y.name]
+
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
+    preds = pd.Series(index=y_clean.index, dtype=float)
+
+    for train_idx, test_idx in tscv.split(X_clean):
+        X_train = X_clean.iloc[train_idx]
+        X_test = X_clean.iloc[test_idx]
+        y_train = y_clean.iloc[train_idx]
+
+        model.fit(X_train, y_train)
+        preds.iloc[test_idx] = model.predict(X_test)
+
+    mse = mean_squared_error(y_clean.loc[preds.dropna().index], preds.dropna())
+    corr = y_clean.loc[preds.dropna().index].corr(preds.dropna())
+
+    return {
+        "mse": mse,
+        "forecast_corr": corr,
+        "predictions": preds
+    }
+
+base_features = pd.concat(
+    [
+        market_df,
+        macro_df
+    ],
+    axis=1
+).shift(1)
+
+def test_incremental_positioning_value(
+    base_features,
+    positioning_features,
+    y,
+    n_splits=5
+):
+    rows = []
+
+    base_score = walk_forward_model_score(
+        base_features,
+        y,
+        n_splits=n_splits
+    )
+
+    base_corr = base_score["forecast_corr"]
+    base_mse = base_score["mse"]
+
+    for col in positioning_features.columns:
+        X_augmented = pd.concat(
+            [
+                base_features,
+                positioning_features[[col]]
+            ],
+            axis=1
+        )
+
+        score = walk_forward_model_score(
+            X_augmented,
+            y,
+            n_splits=n_splits
+        )
+
+        rows.append({
+            "signal": col,
+            "base_corr": base_corr,
+            "augmented_corr": score["forecast_corr"],
+            "delta_corr": score["forecast_corr"] - base_corr,
+            "base_mse": base_mse,
+            "augmented_mse": score["mse"],
+            "delta_mse": score["mse"] - base_mse
+        })
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values("delta_corr", ascending=False)
+        .reset_index(drop=True)
+    )
+
+incremental_results = test_incremental_positioning_value(
+    base_features=base_features,
+    positioning_features=positioning_z,
+    y=y_3m,
+    n_splits=5
+)
+
+incremental_results.head(20)
+
+positive delta_corr
+negative delta_mse
+stable performance across windows
+
+
+def combine_positioning_tests(
+    return_results,
+    direction_results,
+    reversal_results,
+    vol_results,
+    drawdown_results,
+    incremental_results
+):
+    result = return_results[[
+        "signal",
+        "ic",
+        "top_minus_bottom",
+        "abs_spread"
+    ]].copy()
+
+    result = result.merge(
+        direction_results[[
+            "signal",
+            "hit_rate_spread",
+            "abs_hit_rate_spread"
+        ]],
+        on="signal",
+        how="left"
+    )
+
+    result = result.merge(
+        reversal_results[[
+            "signal",
+            "crowded_minus_normal",
+            "underowned_minus_normal",
+            "crowded_obs",
+            "underowned_obs"
+        ]],
+        on="signal",
+        how="left"
+    )
+
+    result = result.merge(
+        vol_results[[
+            "signal",
+            "top_minus_bottom"
+        ]].rename(columns={
+            "top_minus_bottom": "vol_top_minus_bottom"
+        }),
+        on="signal",
+        how="left"
+    )
+
+    result = result.merge(
+        drawdown_results[[
+            "signal",
+            "top_minus_bottom"
+        ]].rename(columns={
+            "top_minus_bottom": "drawdown_top_minus_bottom"
+        }),
+        on="signal",
+        how="left"
+    )
+
+    result = result.merge(
+        incremental_results[[
+            "signal",
+            "delta_corr",
+            "delta_mse"
+        ]],
+        on="signal",
+        how="left"
+    )
+
+    return result
+
+summary = combine_positioning_tests(
+    return_results=forward_return_results,
+    direction_results=direction_results,
+    reversal_results=reversal_results,
+    vol_results=vol_results,
+    drawdown_results=drawdown_results,
+    incremental_results=incremental_results
+)
+
+
+def add_selection_score(summary):
+    df = summary.copy()
+
+    def rank_abs(series):
+        return series.abs().rank(pct=True)
+
+    df["return_score"] = rank_abs(df["top_minus_bottom"])
+    df["direction_score"] = rank_abs(df["hit_rate_spread"])
+    df["reversal_score"] = rank_abs(df["crowded_minus_normal"])
+    df["risk_score"] = rank_abs(df["drawdown_top_minus_bottom"])
+    df["incremental_score"] = df["delta_corr"].rank(pct=True)
+
+    df["selection_score"] = (
+        0.25 * df["return_score"] +
+        0.15 * df["direction_score"] +
+        0.25 * df["reversal_score"] +
+        0.15 * df["risk_score"] +
+        0.20 * df["incremental_score"]
+    )
+
+    return df.sort_values("selection_score", ascending=False)
+
+
+
+
+1. Top 2–3 signals for return prediction
+2. Top 2–3 signals for reversal risk
+3. Top 2–3 signals for volatility/drawdown risk
+4. Top 2–3 signals with genuine incremental value
+
+
+
+
+def remove_correlated_signals(ranked_signals, signal_df, max_corr=0.75, max_signals=10):
+    selected = []
+
+    for signal in ranked_signals["signal"]:
+        if signal not in signal_df.columns:
+            continue
+
+        if len(selected) == 0:
+            selected.append(signal)
+            continue
+
+        corr_with_selected = signal_df[selected + [signal]].corr()[signal].drop(signal)
+
+        if corr_with_selected.abs().max() < max_corr:
+            selected.append(signal)
+
+        if len(selected) >= max_signals:
+            break
+
+    return selected
+
+
+selected_positioning_signals = remove_correlated_signals(
+    ranked_positioning_signals,
+    positioning_pct,
+    max_corr=0.75,
+    max_signals=10
+)
+
+selected_positioning_signals
+
+selected_positioning_score = positioning_z[selected_positioning_signals].mean(axis=1)
+
+
+crowding_signals = [
+    # selected signals where high value means crowded long
+]
+
+risk_signals = [
+    # selected signals that predict drawdown/vol
+]
+
+contrarian_signals = [
+    # selected signals where extremes predict rebound
+]
+
+composite_scores = pd.DataFrame(index=positioning_z.index)
+
+composite_scores["crowding_score"] = positioning_z[crowding_signals].mean(axis=1)
+composite_scores["risk_score"] = positioning_z[risk_signals].mean(axis=1)
+composite_scores["contrarian_score"] = positioning_z[contrarian_signals].mean(axis=1)
+
+
+
+1. Meaningful top-minus-bottom return spread
+2. Strong reversal behavior at extremes
+3. Predicts volatility or drawdown
+4. Adds value beyond macro/trend features
+5. Has enough observations
+6. Is not just a duplicate of another better signal
+
+1. Reversal/crowding test
+2. Drawdown-risk test
+3. Incremental-value test
+
+
+
+
+
+
+
+
+
+
+
+
+
