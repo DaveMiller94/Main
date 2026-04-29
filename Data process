@@ -1,0 +1,493 @@
+returns
+
+import numpy as np
+import pandas as pd
+
+
+def simple_returns(prices: pd.DataFrame | pd.Series) -> pd.DataFrame | pd.Series:
+    """Calculate simple returns from prices."""
+    return prices.pct_change()
+
+
+def log_returns(prices: pd.DataFrame | pd.Series) -> pd.DataFrame | pd.Series:
+    """Calculate log returns from prices."""
+    return np.log(prices / prices.shift(1))
+
+
+def cumulative_returns(returns: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
+    """Convert periodic simple returns into cumulative wealth index."""
+    return (1 + returns).cumprod()
+
+
+def forward_returns(
+    returns: pd.Series,
+    horizon: int = 1,
+    name: str | None = None
+) -> pd.Series:
+    """
+    Create forward compounded simple return target.
+
+    Example:
+    horizon=3 means next 3-period return.
+    """
+    fwd = (
+        (1 + returns)
+        .rolling(horizon)
+        .apply(np.prod, raw=True)
+        .shift(-horizon)
+        - 1
+    )
+
+    if name:
+        fwd.name = name
+    else:
+        fwd.name = f"{returns.name}_fwd_{horizon}"
+
+    return fwd
+
+data cleaning 
+import pandas as pd
+
+
+def ensure_datetime_index(df: pd.DataFrame | pd.Series):
+    """Ensure index is datetime and sorted."""
+    df = df.copy()
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    return df
+
+
+def remove_duplicate_dates(df: pd.DataFrame | pd.Series):
+    """Remove duplicate index values, keeping the last observation."""
+    return df[~df.index.duplicated(keep="last")]
+
+
+def clean_time_index(df: pd.DataFrame | pd.Series):
+    """Standard time-index cleaning."""
+    df = ensure_datetime_index(df)
+    df = remove_duplicate_dates(df)
+    return df
+
+
+def drop_invalid_prices(prices: pd.DataFrame | pd.Series):
+    """Remove non-positive prices."""
+    return prices.where(prices > 0)
+
+
+def winsorize(
+    x: pd.Series | pd.DataFrame,
+    lower_q: float = 0.01,
+    upper_q: float = 0.99
+):
+    """Winsorize extreme values column-by-column."""
+    lower = x.quantile(lower_q)
+    upper = x.quantile(upper_q)
+    return x.clip(lower=lower, upper=upper, axis=1 if isinstance(x, pd.DataFrame) else 0)
+
+
+def safe_ffill(
+    df: pd.DataFrame | pd.Series,
+    limit: int | None = None
+):
+    """Forward-fill missing values with optional limit."""
+    return df.ffill(limit=limit)
+
+transforms 
+import numpy as np
+import pandas as pd
+
+
+def rolling_zscore(
+    x: pd.Series | pd.DataFrame,
+    window: int = 36,
+    min_periods: int | None = None
+):
+    """Rolling z-score."""
+    if min_periods is None:
+        min_periods = window
+
+    mean = x.rolling(window, min_periods=min_periods).mean()
+    std = x.rolling(window, min_periods=min_periods).std()
+
+    return (x - mean) / std
+
+
+def rolling_percentile_rank(
+    x: pd.Series | pd.DataFrame,
+    window: int = 60,
+    min_periods: int | None = None
+):
+    """Rolling percentile rank of latest observation."""
+
+    if min_periods is None:
+        min_periods = window
+
+    def pct_rank(arr):
+        s = pd.Series(arr)
+        return s.rank(pct=True).iloc[-1]
+
+    return x.rolling(window, min_periods=min_periods).apply(pct_rank, raw=False)
+
+
+def yoy_change(x: pd.Series | pd.DataFrame, periods: int = 12):
+    """Year-over-year percentage change."""
+    return x.pct_change(periods)
+
+
+def period_change(x: pd.Series | pd.DataFrame, periods: int = 1):
+    """Absolute change over period."""
+    return x.diff(periods)
+
+
+def percent_change(x: pd.Series | pd.DataFrame, periods: int = 1):
+    """Percentage change over period."""
+    return x.pct_change(periods)
+
+
+def moving_average_gap(
+    x: pd.Series | pd.DataFrame,
+    window: int = 12
+):
+    """Current value minus rolling average."""
+    return x - x.rolling(window).mean()
+
+
+def rolling_sum(
+    x: pd.Series | pd.DataFrame,
+    window: int = 4
+):
+    """Rolling sum, useful for flows."""
+    return x.rolling(window).sum()
+
+
+def net_position(
+    longs: pd.Series,
+    shorts: pd.Series
+):
+    """Net positioning: longs minus shorts."""
+    return longs - shorts
+
+
+def net_position_ratio(
+    longs: pd.Series,
+    shorts: pd.Series
+):
+    """
+    Normalized net positioning:
+    (longs - shorts) / (longs + shorts)
+    """
+    denominator = longs + shorts
+    return (longs - shorts) / denominator.replace(0, np.nan)
+
+
+aligbment
+
+import pandas as pd
+
+
+def to_monthly_last(df: pd.DataFrame | pd.Series):
+    """Convert to month-end observations."""
+    return df.resample("M").last()
+
+
+def to_weekly_last(df: pd.DataFrame | pd.Series):
+    """Convert to Friday weekly observations."""
+    return df.resample("W-FRI").last()
+
+
+def daily_prices_to_monthly_returns(prices: pd.DataFrame | pd.Series):
+    """Convert daily prices to monthly simple returns."""
+    monthly_prices = prices.resample("M").last()
+    return monthly_prices.pct_change()
+
+
+def align_to_monthly(
+    datasets: dict[str, pd.DataFrame | pd.Series],
+    method: str = "last"
+):
+    """
+    Align multiple datasets to monthly frequency.
+
+    datasets:
+        {"spx": spx_df, "macro": macro_df, ...}
+
+    method:
+        "last" or "mean"
+    """
+    aligned = []
+
+    for name, df in datasets.items():
+        df = df.copy()
+
+        if method == "last":
+            resampled = df.resample("M").last()
+        elif method == "mean":
+            resampled = df.resample("M").mean()
+        else:
+            raise ValueError("method must be 'last' or 'mean'")
+
+        if isinstance(resampled, pd.Series):
+            resampled = resampled.to_frame(name)
+
+        aligned.append(resampled.add_prefix(f"{name}_"))
+
+    return pd.concat(aligned, axis=1)
+
+
+def lag_features(
+    features: pd.DataFrame,
+    periods: int = 1
+):
+    """Lag features to avoid lookahead bias."""
+    return features.shift(periods)
+
+
+def merge_features_and_target(
+    features: pd.DataFrame,
+    target: pd.Series,
+    lag_features_by: int = 1,
+    dropna: bool = True
+):
+    """Lag features and merge with target."""
+    X = features.shift(lag_features_by)
+    y = target.copy()
+
+    dataset = pd.concat([X, y], axis=1)
+
+    if dropna:
+        dataset = dataset.dropna()
+
+    return dataset
+
+
+validation
+
+import pandas as pd
+
+
+def check_datetime_index(df: pd.DataFrame | pd.Series):
+    """Check whether index is datetime."""
+    return isinstance(df.index, pd.DatetimeIndex)
+
+
+def check_sorted_index(df: pd.DataFrame | pd.Series):
+    """Check whether index is sorted."""
+    return df.index.is_monotonic_increasing
+
+
+def check_duplicate_dates(df: pd.DataFrame | pd.Series):
+    """Return duplicate dates."""
+    return df.index[df.index.duplicated()].unique()
+
+
+def missing_summary(df: pd.DataFrame):
+    """Summarize missing values."""
+    return pd.DataFrame({
+        "missing_count": df.isna().sum(),
+        "missing_pct": df.isna().mean()
+    }).sort_values("missing_pct", ascending=False)
+
+
+def data_quality_report(df: pd.DataFrame):
+    """Basic data quality report."""
+    return {
+        "datetime_index": check_datetime_index(df),
+        "sorted_index": check_sorted_index(df),
+        "duplicate_dates": list(check_duplicate_dates(df)),
+        "start_date": df.index.min(),
+        "end_date": df.index.max(),
+        "rows": len(df),
+        "columns": len(df.columns),
+        "missing": missing_summary(df)
+    }
+
+
+
+
+master
+
+import pandas as pd
+
+from .data_cleaning import clean_time_index
+from .alignment import to_monthly_last, lag_features
+from .returns import simple_returns, forward_returns
+from .transforms import rolling_zscore, rolling_percentile_rank
+
+
+class MasterDatasetBuilder:
+    """
+    Build a clean master research dataset from market, macro,
+    positioning, and flow data.
+    """
+
+    def __init__(self, frequency: str = "M"):
+        self.frequency = frequency
+        self.datasets = {}
+
+    def add_dataset(self, name: str, df: pd.DataFrame | pd.Series):
+        df = clean_time_index(df)
+        self.datasets[name] = df
+        return self
+
+    def resample(self, df: pd.DataFrame | pd.Series):
+        if self.frequency == "M":
+            return df.resample("M").last()
+        elif self.frequency == "W":
+            return df.resample("W-FRI").last()
+        else:
+            raise ValueError("frequency must be 'M' or 'W'")
+
+    def build_panel(self):
+        aligned = []
+
+        for name, df in self.datasets.items():
+            resampled = self.resample(df)
+
+            if isinstance(resampled, pd.Series):
+                resampled = resampled.to_frame(name)
+
+            aligned.append(resampled.add_prefix(f"{name}_"))
+
+        return pd.concat(aligned, axis=1)
+
+    def build_features(
+        self,
+        zscore_window: int = 36,
+        percentile_window: int = 60
+    ):
+        panel = self.build_panel()
+
+        features = pd.concat([
+            panel,
+            rolling_zscore(panel, window=zscore_window).add_suffix("_z"),
+            rolling_percentile_rank(panel, window=percentile_window).add_suffix("_pct")
+        ], axis=1)
+
+        return features
+
+    def build_model_dataset(
+        self,
+        target: pd.Series,
+        lag: int = 1,
+        zscore_window: int = 36,
+        percentile_window: int = 60,
+        dropna: bool = True
+    ):
+        features = self.build_features(
+            zscore_window=zscore_window,
+            percentile_window=percentile_window
+        )
+
+        X = lag_features(features, periods=lag)
+
+        dataset = pd.concat([X, target], axis=1)
+
+        if dropna:
+            dataset = dataset.dropna()
+
+        return dataset
+
+
+innit
+from .returns import (
+    simple_returns,
+    log_returns,
+    cumulative_returns,
+    forward_returns
+)
+
+from .data_cleaning import (
+    clean_time_index,
+    ensure_datetime_index,
+    remove_duplicate_dates,
+    drop_invalid_prices,
+    winsorize,
+    safe_ffill
+)
+
+from .transforms import (
+    rolling_zscore,
+    rolling_percentile_rank,
+    yoy_change,
+    period_change,
+    percent_change,
+    moving_average_gap,
+    rolling_sum,
+    net_position,
+    net_position_ratio
+)
+
+from .alignment import (
+    to_monthly_last,
+    to_weekly_last,
+    daily_prices_to_monthly_returns,
+    align_to_monthly,
+    lag_features,
+    merge_features_and_target
+)
+
+from .validation import (
+    data_quality_report,
+    missing_summary
+)
+
+from .master_dataset import MasterDatasetBuilder
+
+
+example
+
+import pandas as pd
+
+from quant_research import (
+    daily_prices_to_monthly_returns,
+    forward_returns,
+    rolling_zscore,
+    rolling_percentile_rank,
+    MasterDatasetBuilder
+)
+
+# Example inputs
+# spx_prices: daily S&P 500 price series
+# macro_df: monthly macro data
+# positioning_df: weekly positioning data
+# flows_df: weekly flow data
+
+spx_monthly_returns = daily_prices_to_monthly_returns(spx_prices)
+
+target = forward_returns(
+    spx_monthly_returns,
+    horizon=3,
+    name="SPX_fwd_3m"
+)
+
+builder = MasterDatasetBuilder(frequency="M")
+
+dataset = (
+    builder
+    .add_dataset("macro", macro_df)
+    .add_dataset("positioning", positioning_df)
+    .add_dataset("flows", flows_df)
+    .build_model_dataset(
+        target=target,
+        lag=1,
+        zscore_window=36,
+        percentile_window=60
+    )
+)
+
+dataset.head()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
